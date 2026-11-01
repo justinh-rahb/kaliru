@@ -29,7 +29,6 @@ const SAMPLE_ERROR_LONG_READ: i64 = 0x40000000;
 pub struct HX711SBase {
     printer: Rc<Printer>,
     name: String,
-    last_error_count: Cell<i64>,
     consecutive_fails: Cell<i64>,
     sensor_type: &'static str,
     mcu: Rc<Mcu>,
@@ -87,7 +86,6 @@ impl HX711SBase {
         let s = Rc::new(HX711SBase {
             printer: printer.clone(),
             name,
-            last_error_count: Cell::new(0),
             consecutive_fails: Cell::new(0),
             sensor_type,
             mcu: mcu.clone(),
@@ -139,7 +137,6 @@ impl HX711SBase {
     // Start, stop, and process message batches
     fn start_measurements(&self) -> KResult<()> {
         self.consecutive_fails.set(0);
-        self.last_error_count.set(0);
         // Start bulk reading
         let rest_ticks = self.mcu.seconds_to_clock(1.0 / (10.0 * self.sps as f64));
         self.query_hx711s_cmd
@@ -169,28 +166,11 @@ impl HX711SBase {
     }
 
     fn process_batch(&self, _eventtime: f64) -> KResult<PyVal> {
-        let prev_overflows = self.ffreader.get_last_overflows();
-        let prev_error_count = self.last_error_count.get();
-        let samples = self.ffreader.pull_samples()?;
-        let (samples, errors) = decode_samples(&samples, &self.name);
-        self.last_error_count.set(self.last_error_count.get() + errors);
-        let overflows = self.ffreader.get_last_overflows() - prev_overflows;
-        let errors = self.last_error_count.get() - prev_error_count;
-        if errors > 0 {
-            logging::error(&format!("{}: Forced sensor restart due to error", self.name));
+        let (samples, overflows) = self.ffreader.pull_samples()?;
+        process_samples(&samples, &self.name, overflows, &self.consecutive_fails, || {
             self.finish_measurements()?;
-            self.start_measurements()?;
-        } else if overflows > 0 {
-            self.consecutive_fails.set(self.consecutive_fails.get() + 1);
-            if self.consecutive_fails.get() > 4 {
-                logging::error(&format!("{}: Forced sensor restart due to overflows", self.name));
-                self.finish_measurements()?;
-                self.start_measurements()?;
-            }
-        } else {
-            self.consecutive_fails.set(0);
-        }
-        Ok(adc_batch(samples, self.last_error_count.get(), self.ffreader.get_last_overflows()))
+            self.start_measurements()
+        })
     }
 }
 
@@ -263,8 +243,39 @@ fn validate_pin_count(sensor_type: &str, dout: usize, sclk: usize) -> KResult<()
     Ok(())
 }
 
+// Keep batch diagnostics in locals: restarting clears reader state, but
+// the probe must still receive the errors/overflows that invalidated this batch.
+fn process_samples(
+    samples: &[(f64, Vec<i64>)],
+    name: &str,
+    overflows: i64,
+    consecutive_fails: &Cell<i64>,
+    restart: impl FnOnce() -> KResult<()>,
+) -> KResult<PyVal> {
+    let (samples, batch_errors) = decode_samples(samples, name);
+    let reason = if batch_errors > 0 {
+        Some("error")
+    } else if overflows > 0 {
+        consecutive_fails.set(consecutive_fails.get() + 1);
+        if consecutive_fails.get() > 4 {
+            Some("overflows")
+        } else {
+            None
+        }
+    } else {
+        consecutive_fails.set(0);
+        None
+    };
+    if let Some(reason) = reason {
+        logging::error(&format!("{}: Forced sensor restart due to {}", name, reason));
+        restart()?;
+    }
+    Ok(adc_batch(samples, batch_errors, overflows))
+}
+
 // A frame is (time, counts0, fraction0, counts1, fraction1, ...).
-// Firmware latches errors into every channel; stop at the first bad frame.
+// Firmware latches errors into every channel. Like the reference, intentionally
+// drop the first bad frame and everything after it; remaining errors are duplicates.
 fn decode_samples(samples: &[(f64, Vec<i64>)], name: &str) -> (Vec<PyVal>, i64) {
     let mut out = vec![];
     for (ptime, channels) in samples {
@@ -300,6 +311,55 @@ mod tests {
             assert_eq!(serde_json::from_str::<serde_json::Value>(&PyVal::List(rows).json()).unwrap(), case["expected"], "{}", case["name"]);
             assert_eq!(errors, case["errors"].as_i64().unwrap(), "{}", case["name"]);
         }
+    }
+
+    fn batch_json(batch: PyVal) -> serde_json::Value {
+        serde_json::from_str(&batch.json()).unwrap()
+    }
+
+    #[test]
+    fn error_batch_reports_errors_even_after_forced_restart() {
+        for error in [SAMPLE_ERROR_DESYNC, SAMPLE_ERROR_LONG_READ] {
+            let failures = Cell::new(3);
+            let restarted = Cell::new(false);
+            let samples = [(0.0, vec![12, 34]), (0.1, vec![error, error]), (0.2, vec![56, 78])];
+            let batch = batch_json(
+                process_samples(&samples, "test", 2, &failures, || {
+                    // Model start_measurements resetting state during recovery.
+                    failures.set(0);
+                    restarted.set(true);
+                    Ok(())
+                })
+                .unwrap(),
+            );
+            assert!(restarted.get());
+            assert_eq!(batch["errors"], 1);
+            assert_eq!(batch["overflows"], 2);
+            assert_eq!(batch["data"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn overflow_diagnostics_are_per_batch_and_survive_restart() {
+        let failures = Cell::new(0);
+        let restarts = Cell::new(0);
+        for _ in 0..5 {
+            let batch = batch_json(
+                process_samples(&[], "test", 2, &failures, || {
+                    failures.set(0);
+                    restarts.set(restarts.get() + 1);
+                    Ok(())
+                })
+                .unwrap(),
+            );
+            assert_eq!(batch["errors"], 0);
+            assert_eq!(batch["overflows"], 2);
+        }
+        assert_eq!(restarts.get(), 1);
+        let batch = batch_json(process_samples(&[], "test", 0, &failures, || panic!("clean batch restarted")).unwrap());
+        assert_eq!(batch["overflows"], 0);
+        assert_eq!(batch["errors"], 0);
+        assert_eq!(failures.get(), 0);
     }
 
     #[test]

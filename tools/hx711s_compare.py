@@ -56,7 +56,10 @@ def commands(path):
             mid, _ = parser.msgid_parser.parse(raw, pos)
             fmt = parser.messages_by_id[mid]
             values, pos = fmt.parse(raw, pos)
-            if 'hx711s' in fmt.name:
+            # Kalico 550d21fb answers debug query commands locally; the older
+            # Pellcorp reference emits a timing-status poll. Compare actual
+            # configuration, attachment and start/stop commands, not that poll.
+            if 'hx711s' in fmt.name and fmt.name != 'query_hx711s_status':
                 result.append(dict(command=fmt.name, **values))
     return result
 
